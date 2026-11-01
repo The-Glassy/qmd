@@ -3931,6 +3931,17 @@ describe("Index Status", () => {
     await cleanupTestDb(store);
   });
 
+  test("two remote endpoints sharing the same #model-id resolve to the same identity and fingerprint", () => {
+    // This is the core vector-compatibility guarantee for fallback groups:
+    // a chunk embedded via host A must be found when searching via host B.
+    const identityA = llmModule.resolveEmbedIdentity("http://host-a:1234/v1#test-embed-model");
+    const identityB = llmModule.resolveEmbedIdentity("http://host-b:5678/v1#test-embed-model");
+
+    expect(identityA).toBe("test-embed-model");
+    expect(identityA).toBe(identityB);
+    expect(getEmbeddingFingerprint(identityA)).toBe(getEmbeddingFingerprint(identityB));
+  });
+
   test("getIndexHealth returns health info", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -5578,6 +5589,9 @@ describe("Embedding batching", () => {
       embedCalls,
       embedBatchModelCalls,
       tokenizeCalls,
+      isRemoteEmbed() {
+        return false;
+      },
       async tokenize(text: string) {
         tokenizeCalls.push(text);
         return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
@@ -6678,6 +6692,7 @@ describe("Embedding batching", () => {
 describe("Token chunking guardrails", () => {
   test("chunkDocumentByTokens keeps pathological single-line blobs under the token limit", async () => {
     setDefaultLlamaCpp({
+      isRemoteEmbed() { return false; },
       async tokenize(text: string) {
         return Array.from({ length: text.length }, () => 1);
       },
@@ -6835,6 +6850,26 @@ describe("Token chunking guardrails", () => {
       expect(chunks.length).toBeGreaterThan(1);
       for (const chunk of chunks) {
         expect(chunk.text.isWellFormed()).toBe(true);
+      }
+    } finally {
+      setDefaultLlamaCpp(null);
+    }
+  });
+
+  test("chunkDocumentByTokens never calls the tokenizer for a remote-embed llm", async () => {
+    // A real LlamaCpp instance configured for remote embedding: isRemoteEmbed()
+    // is true, and it deliberately has no working local tokenizer/GGUF to fall
+    // back to, so any accidental tokenize() call here would throw.
+    const remoteLlm = new llmModule.LlamaCpp({ embedModel: "http://localhost:1234/v1#test-embed-model" });
+
+    const content = "# Doc\n\n" + "remote chunking should not need a tokenizer. ".repeat(300);
+    setDefaultLlamaCpp(remoteLlm);
+    try {
+      const chunks = await chunkDocumentByTokens(content);
+
+      expect(chunks.length).toBeGreaterThan(0);
+      for (const chunk of chunks) {
+        expect(chunk.tokens).toBe(Math.ceil(chunk.text.length / 3));
       }
     } finally {
       setDefaultLlamaCpp(null);

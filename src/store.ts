@@ -3836,6 +3836,10 @@ function stripUnpairedSurrogates(text: string): string {
  *
  * When filepath and chunkStrategy are provided, uses AST-aware break points
  * for supported code files.
+ *
+ * Remote-embed `llm` instances have no local tokenizer, so this skips the
+ * tokenize/detokenize verification pass entirely and returns the char-based
+ * first pass with estimated token counts instead.
  */
 async function chunkDocumentByTokensWithLlm(
   llm: LlamaCpp,
@@ -3857,6 +3861,15 @@ async function chunkDocumentByTokensWithLlm(
   // Chunk in character space with conservative estimate
   // Use AST-aware chunking for the first pass when filepath/strategy provided
   let charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
+
+  // Custom/SDK-injected LLMs may predate isRemoteEmbed(); treat them as local.
+  if (typeof llm.isRemoteEmbed === "function" && llm.isRemoteEmbed()) {
+    return charChunks.map((chunk) => ({
+      text: chunk.text,
+      pos: chunk.pos,
+      tokens: Math.ceil(chunk.text.length / avgCharsPerToken),
+    }));
+  }
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
@@ -5050,7 +5063,9 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
     : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
-  return result?.embedding || null;
+  // An empty vector (e.g. a misbehaving remote server returning `data: []`)
+  // is truthy but useless — treat it the same as a failed embed.
+  return result?.embedding?.length ? result.embedding : null;
 }
 
 /**
