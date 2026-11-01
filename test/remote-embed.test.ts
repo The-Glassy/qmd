@@ -360,3 +360,38 @@ describe("RemoteEmbedder throttling", () => {
     expect(times[2]! - times[1]!).toBeGreaterThanOrEqual(55);
   });
 });
+
+describe("RemoteEmbedder transient socket errors", () => {
+  const reset = () => Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } });
+
+  test("retries once on ECONNRESET without marking the endpoint unhealthy", async () => {
+    let calls = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      calls++;
+      if (calls === 1) throw reset();
+      return jsonResponse(embeddingsBody([[1]]));
+    });
+    const embedder = new RemoteEmbedder([parseRemoteEmbedUri("http://a:1234/v1#m")]);
+
+    expect(await embedder.embedBatch(["x"])).toEqual([[1]]);
+    expect(await embedder.embedBatch(["y"])).toEqual([[1]]);
+    expect(calls).toBe(3);
+  });
+
+  test("a second reset in a row still fails the endpoint", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => { throw reset(); });
+    const embedder = new RemoteEmbedder([parseRemoteEmbedUri("http://a:1234/v1#m")]);
+    await expect(embedder.embedBatch(["x"])).rejects.toBeInstanceOf(RemoteEmbedAllFailedError);
+  });
+
+  test("a refused connection is not retried", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+    });
+    const embedder = new RemoteEmbedder([parseRemoteEmbedUri("http://a:1234/v1#m")]);
+    await expect(embedder.embedBatch(["x"])).rejects.toBeInstanceOf(RemoteEmbedAllFailedError);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+});

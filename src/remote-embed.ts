@@ -130,6 +130,17 @@ export function parseEmbeddingsResponse(body: unknown, count: number): number[][
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
+ * A connection-level failure worth one immediate retry: typically a pooled
+ * keep-alive socket the server already closed (undici: "fetch failed", cause
+ * ECONNRESET / UND_ERR_SOCKET). Timeouts and refused connections are not.
+ */
+export function isTransientSocketError(error: unknown): boolean {
+  const cause = (error as { cause?: { code?: unknown } })?.cause;
+  const code = typeof cause?.code === "string" ? cause.code : "";
+  return ["ECONNRESET", "EPIPE", "UND_ERR_SOCKET", "UND_ERR_CLOSED"].includes(code);
+}
+
+/**
  * Client for one or more OpenAI-compatible `/v1/embeddings` endpoints, with
  * sequential fallback and independent per-endpoint unhealthy TTLs (mirrors
  * localcrab's ResilientEmbeddingFunction).
@@ -215,11 +226,16 @@ export class RemoteEmbedder {
       if (!this.isHealthy(i)) continue;
       const endpoint = this.endpoints[i]!;
       try {
-        const resp = await fetch(`${endpoint.apiBase}/embeddings`, {
+        const send = () => fetch(`${endpoint.apiBase}/embeddings`, {
           method: "POST",
           headers: this.headers(),
           body: JSON.stringify({ model: endpoint.modelId, input: inputs }),
           signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        // One stale keep-alive socket must not take the endpoint out for healthTtlMs.
+        const resp = await send().catch((error) => {
+          if (isTransientSocketError(error)) return send();
+          throw error;
         });
         if (!resp.ok) {
           const detail = await resp.text().catch(() => "");
