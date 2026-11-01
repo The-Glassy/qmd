@@ -62,14 +62,28 @@ export type RemoteEmbedderOptions = {
   maxChars?: number;
   /** L2-normalize returned vectors. Default true. */
   normalize?: boolean;
+  /** Max texts per `/embeddings` request; larger batches are split. Default: no limit. */
+  batchSize?: number;
+  /** Pause (ms) between consecutive requests of one call, to throttle load on a shared server. Default 0. */
+  delayMs?: number;
 };
 
 /** Thrown when every configured endpoint is unhealthy or failed for a given call. */
 export class RemoteEmbedAllFailedError extends Error {}
 
-type EmbeddingsResponse = {
-  data: { embedding: number[] }[];
-};
+/**
+ * The server answered but rejected the input itself (e.g. llama.cpp's
+ * "input (N tokens) is too large to process"). The endpoint is healthy, so it
+ * is not marked unhealthy and the other endpoints are not tried.
+ */
+export class RemoteEmbedInputError extends Error {}
+
+/** HTTP statuses / messages that mean "this input", not "this server". */
+function isInputRejection(status: number, body: string): boolean {
+  if (status === 413) return true;
+  return (status === 400 || status === 500)
+    && /too large|too long|context (length|size|window)|exceeds?|maximum .*tokens|batch size/i.test(body);
+}
 
 function l2Normalize(vector: number[]): number[] {
   let sumSquares = 0;
@@ -78,6 +92,42 @@ function l2Normalize(vector: number[]): number[] {
   if (norm === 0) return vector;
   return vector.map((v) => v / norm);
 }
+
+/**
+ * Validate an OpenAI-style `/embeddings` response for `count` inputs and return
+ * the vectors in input order. Entries are placed by their `index` (the API does
+ * not promise response order); a response without any `index` is taken
+ * positionally. Throws on a wrong count, missing/duplicate/out-of-range
+ * indexes, non-finite values or mixed dimensions, so a malformed response can
+ * never attach a vector to the wrong chunk.
+ */
+export function parseEmbeddingsResponse(body: unknown, count: number): number[][] {
+  const data = (body as { data?: unknown })?.data;
+  if (!Array.isArray(data)) throw new Error("response has no data array");
+  if (data.length !== count) throw new Error(`expected ${count} embeddings, got ${data.length}`);
+  const hasIndex = data.some((item) => (item as { index?: unknown })?.index !== undefined);
+  const out: (number[] | undefined)[] = new Array(count);
+  let dims: number | undefined;
+  data.forEach((item, position) => {
+    const { index, embedding } = (item ?? {}) as { index?: unknown; embedding?: unknown };
+    const slot = hasIndex ? index : position;
+    if (typeof slot !== "number" || !Number.isInteger(slot) || slot < 0 || slot >= count) {
+      throw new Error(`invalid embedding index ${String(slot)}`);
+    }
+    if (out[slot]) throw new Error(`duplicate embedding index ${slot}`);
+    if (!Array.isArray(embedding) || embedding.length === 0 || !embedding.every((v) => typeof v === "number" && Number.isFinite(v))) {
+      throw new Error(`embedding ${slot} is not a non-empty array of finite numbers`);
+    }
+    if (dims !== undefined && embedding.length !== dims) {
+      throw new Error(`embedding ${slot} has ${embedding.length} dimensions, expected ${dims}`);
+    }
+    dims = embedding.length;
+    out[slot] = embedding as number[];
+  });
+  return out as number[][];
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
  * Client for one or more OpenAI-compatible `/v1/embeddings` endpoints, with
@@ -91,7 +141,10 @@ export class RemoteEmbedder {
   private readonly healthTtlMs: number;
   private readonly maxChars: number;
   private readonly normalize: boolean;
+  private readonly batchSize: number;
+  private readonly delayMs: number;
   private readonly unhealthyUntil: number[];
+  private requests = 0;
 
   constructor(endpoints: RemoteEmbedEndpoint[], opts: RemoteEmbedderOptions = {}) {
     this.endpoints = endpoints;
@@ -100,6 +153,8 @@ export class RemoteEmbedder {
     this.healthTtlMs = opts.healthTtlMs ?? DEFAULT_REMOTE_EMBED_HEALTH_TTL_MS;
     this.maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS;
     this.normalize = opts.normalize ?? true;
+    this.batchSize = opts.batchSize && opts.batchSize > 0 ? Math.floor(opts.batchSize) : Infinity;
+    this.delayMs = opts.delayMs && opts.delayMs > 0 ? opts.delayMs : 0;
     this.unhealthyUntil = endpoints.map(() => 0);
   }
 
@@ -119,14 +174,42 @@ export class RemoteEmbedder {
   }
 
   /**
-   * Embed a batch of texts by trying each healthy endpoint in order.
-   * The first endpoint to respond successfully wins; its response order is
-   * expected to match the input order (one embedding object per input text).
+   * Embed a batch of texts. Inputs are sent in requests of at most `batchSize`
+   * texts, `delayMs` apart. A text the server rejects (e.g. over its context
+   * size) comes back as `null` instead of failing its whole request: a rejected
+   * multi-text request is retried one text at a time. Throws
+   * RemoteEmbedAllFailedError when no endpoint can be reached.
    */
-  async embedBatch(texts: string[]): Promise<number[][]> {
+  async embedBatch(texts: string[]): Promise<(number[] | null)[]> {
     if (texts.length === 0) return [];
 
     const inputs = texts.map((t) => (t.length > this.maxChars ? t.slice(0, this.maxChars) : t));
+    const results: (number[] | null)[] = [];
+    for (let start = 0; start < inputs.length; start += this.batchSize) {
+      results.push(...await this.embedGroup(inputs.slice(start, start + this.batchSize)));
+    }
+    return results;
+  }
+
+  private async embedGroup(inputs: string[]): Promise<(number[] | null)[]> {
+    try {
+      return await this.request(inputs);
+    } catch (error) {
+      if (!(error instanceof RemoteEmbedInputError)) throw error;
+      if (inputs.length === 1) {
+        console.warn(`QMD Warning: remote embed rejected one input (${error.message}); it gets no vector.`);
+        return [null];
+      }
+      const results: (number[] | null)[] = [];
+      for (const input of inputs) results.push(...await this.embedGroup([input]));
+      return results;
+    }
+  }
+
+  /** One `/embeddings` request, trying each healthy endpoint in order. */
+  private async request(inputs: string[]): Promise<number[][]> {
+    if (this.delayMs > 0 && this.requests > 0) await sleep(this.delayMs);
+    this.requests++;
 
     for (let i = 0; i < this.endpoints.length; i++) {
       if (!this.isHealthy(i)) continue;
@@ -139,12 +222,16 @@ export class RemoteEmbedder {
           signal: AbortSignal.timeout(this.timeoutMs),
         });
         if (!resp.ok) {
+          const detail = await resp.text().catch(() => "");
+          if (isInputRejection(resp.status, detail)) {
+            throw new RemoteEmbedInputError(`HTTP ${resp.status}: ${detail.slice(0, 200)}`);
+          }
           throw new Error(`remote embed endpoint ${endpoint.apiBase} returned HTTP ${resp.status}`);
         }
-        const body = (await resp.json()) as EmbeddingsResponse;
-        const vectors = body.data.map((item) => item.embedding);
+        const vectors = parseEmbeddingsResponse(await resp.json(), inputs.length);
         return this.normalize ? vectors.map(l2Normalize) : vectors;
       } catch (error) {
+        if (error instanceof RemoteEmbedInputError) throw error;
         console.warn(
           `QMD Warning: remote embed endpoint ${endpoint.apiBase} failed (${error instanceof Error ? error.message : String(error)}), marking unhealthy for ${this.healthTtlMs}ms.`
         );
@@ -155,7 +242,7 @@ export class RemoteEmbedder {
     throw new RemoteEmbedAllFailedError("all remote embedding endpoints failed or unhealthy");
   }
 
-  /** Convenience wrapper around embedBatch for a single text. */
+  /** Convenience wrapper around embedBatch for a single text; [] when the server rejected it. */
   async embed(text: string): Promise<number[]> {
     const [result] = await this.embedBatch([text]);
     return result ?? [];

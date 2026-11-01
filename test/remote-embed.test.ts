@@ -10,6 +10,7 @@ import {
   parseRemoteEmbedUri,
   RemoteEmbedder,
   RemoteEmbedAllFailedError,
+  parseEmbeddingsResponse,
   type RemoteEmbedEndpoint,
 } from "../src/remote-embed.js";
 
@@ -250,5 +251,112 @@ describe("RemoteEmbedder.embed", () => {
     const embedder = new RemoteEmbedder([endpoint], { normalize: false });
 
     expect(await embedder.embed("hello")).toEqual([1, 0]);
+  });
+});
+
+describe("parseEmbeddingsResponse", () => {
+  test("places vectors by index, not response position", () => {
+    const body = { data: [{ index: 1, embedding: [0, 1] }, { index: 0, embedding: [1, 0] }] };
+    expect(parseEmbeddingsResponse(body, 2)).toEqual([[1, 0], [0, 1]]);
+  });
+
+  test("takes a response without indexes positionally", () => {
+    expect(parseEmbeddingsResponse(embeddingsBody([[1], [2]]), 2)).toEqual([[1], [2]]);
+  });
+
+  test.each([
+    ["a missing entry", { data: [{ index: 0, embedding: [1] }] }],
+    ["a duplicate index", { data: [{ index: 0, embedding: [1] }, { index: 0, embedding: [2] }] }],
+    ["an out-of-range index", { data: [{ index: 0, embedding: [1] }, { index: 2, embedding: [2] }] }],
+    ["a fractional index", { data: [{ index: 0, embedding: [1] }, { index: 0.5, embedding: [2] }] }],
+    ["a non-finite value", { data: [{ index: 0, embedding: [1] }, { index: 1, embedding: [null] }] }],
+    ["mixed dimensions", { data: [{ index: 0, embedding: [1] }, { index: 1, embedding: [1, 2] }] }],
+    ["an empty vector", { data: [{ index: 0, embedding: [1] }, { index: 1, embedding: [] }] }],
+    ["no data array", { error: "x" }],
+  ])("rejects %s", (_name, body) => {
+    expect(() => parseEmbeddingsResponse(body, 2)).toThrow();
+  });
+});
+
+describe("RemoteEmbedder input rejection", () => {
+  const tooLarge = () => jsonResponse(
+    { error: { code: 500, message: "input (1802 tokens) is too large to process. increase the physical batch size (current batch size: 512)" } },
+    500,
+  );
+
+  test("retries a rejected batch one text at a time and returns null only for the rejected text", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const input = JSON.parse(String(init?.body)).input as string[];
+      if (input.some((t) => t.startsWith("huge"))) return tooLarge();
+      return jsonResponse(embeddingsBody(input.map(() => [1, 0])));
+    });
+    const embedder = new RemoteEmbedder([parseRemoteEmbedUri("http://a:1234/v1#m")]);
+
+    const result = await embedder.embedBatch(["ok-1", "huge text", "ok-2"]);
+
+    expect(result).toEqual([[1, 0], null, [1, 0]]);
+    expect(fetchSpy).toHaveBeenCalledTimes(4); // the batch, then each text
+  });
+
+  test("does not mark the endpoint unhealthy or fail over on an input rejection", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const urls: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      urls.push(String(url));
+      const input = JSON.parse(String(init?.body)).input as string[];
+      if (input[0] === "huge") return tooLarge();
+      return jsonResponse(embeddingsBody(input.map(() => [1])));
+    });
+    const embedder = new RemoteEmbedder([
+      parseRemoteEmbedUri("http://a:1234/v1#m"),
+      parseRemoteEmbedUri("http://b:1234/v1#m"),
+    ]);
+
+    expect(await embedder.embedBatch(["huge"])).toEqual([null]);
+    expect(await embedder.embedBatch(["fine"])).toEqual([[1]]);
+    expect(urls.every((u) => u.startsWith("http://a:1234"))).toBe(true);
+  });
+
+  test("a plain HTTP 500 is still an endpoint failure", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ error: "boom" }, 500));
+    const embedder = new RemoteEmbedder([parseRemoteEmbedUri("http://a:1234/v1#m")]);
+    await expect(embedder.embedBatch(["x"])).rejects.toBeInstanceOf(RemoteEmbedAllFailedError);
+  });
+});
+
+describe("RemoteEmbedder throttling", () => {
+  test("splits into requests of batchSize texts", async () => {
+    const sizes: number[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const input = JSON.parse(String(init?.body)).input as string[];
+      sizes.push(input.length);
+      return jsonResponse(embeddingsBody(input.map((t) => [Number(t)])));
+    });
+    const embedder = new RemoteEmbedder([parseRemoteEmbedUri("http://a:1234/v1#m")], { batchSize: 2, normalize: false });
+
+    const result = await embedder.embedBatch(["1", "2", "3", "4", "5"]);
+
+    expect(sizes).toEqual([2, 2, 1]);
+    expect(result).toEqual([[1], [2], [3], [4], [5]]);
+  });
+
+  test("waits delayMs between requests but not before the first", async () => {
+    const times: number[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      times.push(Date.now());
+      const input = JSON.parse(String(init?.body)).input as string[];
+      return jsonResponse(embeddingsBody(input.map(() => [1])));
+    });
+    const embedder = new RemoteEmbedder([parseRemoteEmbedUri("http://a:1234/v1#m")], { batchSize: 1, delayMs: 60 });
+
+    const started = Date.now();
+    await embedder.embedBatch(["a", "b", "c"]);
+
+    expect(times).toHaveLength(3);
+    expect(times[0]! - started).toBeLessThan(50);
+    expect(times[1]! - times[0]!).toBeGreaterThanOrEqual(55);
+    expect(times[2]! - times[1]!).toBeGreaterThanOrEqual(55);
   });
 });

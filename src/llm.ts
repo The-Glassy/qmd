@@ -950,6 +950,9 @@ export class LlamaCpp implements LLM {
         apiKey: process.env.QMD_EMBED_API_KEY ?? process.env.OPENAI_API_KEY,
         timeoutMs: Number(process.env.QMD_EMBED_TIMEOUT_MS) || undefined,
         healthTtlMs: Number(process.env.QMD_EMBED_HEALTH_TTL_MS) || undefined,
+        maxChars: Number(process.env.QMD_EMBED_MAX_CHARS) || undefined,
+        batchSize: Number(process.env.QMD_EMBED_BATCH_SIZE) || undefined,
+        delayMs: Number(process.env.QMD_EMBED_DELAY_MS) || undefined,
       });
     }
     return this.remoteEmbedder;
@@ -1544,6 +1547,7 @@ export class LlamaCpp implements LLM {
     if (this.isRemoteEmbed()) {
       try {
         const embedding = await this.ensureRemoteEmbedder().embed(text);
+        if (embedding.length === 0) return null;
         return { embedding, model: options.model ?? this.embedModelUri };
       } catch (error) {
         console.error("Embedding error:", error);
@@ -1584,7 +1588,7 @@ export class LlamaCpp implements LLM {
       if (texts.length === 0) return [];
       try {
         const vectors = await this.ensureRemoteEmbedder().embedBatch(texts);
-        return vectors.map((embedding) => ({ embedding, model: options.model ?? this.embedModelUri }));
+        return vectors.map((embedding) => embedding ? { embedding, model: options.model ?? this.embedModelUri } : null);
       } catch (error) {
         console.error("Batch embedding error:", error);
         return texts.map(() => null);
