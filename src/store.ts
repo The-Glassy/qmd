@@ -6609,6 +6609,7 @@ export interface VectorSearchResult {
   context: string | null;
   docid: string;
   metadata: DocumentMetadata;
+  chunkPos?: number;  // character position of the best-matching chunk in body
 }
 
 /**
@@ -6658,6 +6659,7 @@ export async function vectorSearchQuery(
           context: store.getContextForFile(r.filepath),
           docid: r.docid,
           metadata: r.metadata,
+          chunkPos: r.chunkPos,
         });
       }
     }

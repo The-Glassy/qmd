@@ -6218,6 +6218,25 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("vectorSearchQuery keeps the matched chunk position for snippets", async () => {
+    const store = await createTestStore();
+    store.db.exec(`CREATE TABLE ${VEC_TABLE} (collection_id INTEGER, embedding BLOB)`);
+    store.llm = { embedModelName: "bge-m3" } as any;
+    store.expandQuery = vi.fn(async () => []) as any;
+    store.searchVec = vi.fn(async () => [{
+      filepath: "qmd://c/a.md", displayPath: "c/a.md", title: "A", body: "x".repeat(5000),
+      hash: "h", docid: "#h", collectionName: "c", modifiedAt: "", bodyLength: 5000,
+      context: null, metadata: {}, score: 0.8, source: "vec", chunkPos: 4200,
+    }]) as any;
+
+    try {
+      const [result] = await vectorSearchQuery(store, "q", { limit: 5, minScore: 0, skipExpansion: true });
+      expect(result?.chunkPos).toBe(4200);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("skipExpansion never calls expandQuery in hybridQuery or vectorSearchQuery", async () => {
     const store = await createTestStore();
     const model = "bge-m3";

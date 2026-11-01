@@ -3198,6 +3198,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       context: r.context,
       docid: r.docid,
       metadata: r.metadata,
+      chunkPos: r.chunkPos,
     })), query, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
