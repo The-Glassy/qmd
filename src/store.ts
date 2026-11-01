@@ -163,13 +163,27 @@ const EMBED_FINGERPRINT_PROBE_DOC = "__qmd_embedding_document_probe__";
 
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
-export const CHUNK_SIZE_TOKENS = 900;
+export const DEFAULT_CHUNK_SIZE_TOKENS = 900;
+
+/**
+ * QMD_CHUNK_SIZE_TOKENS overrides the chunk size, e.g. for an embedding server
+ * with a small context (llama-server -c 512 rejects longer inputs). Overlap and
+ * break-point window scale with it; the size is part of the embedding
+ * fingerprint, so changing it re-embeds on the next `qmd embed`.
+ */
+export function resolveChunkSizeTokens(env: string | undefined = process.env.QMD_CHUNK_SIZE_TOKENS): number {
+  const value = Number(env?.trim());
+  if (!env?.trim() || !Number.isInteger(value) || value < 64 || value > 8192) return DEFAULT_CHUNK_SIZE_TOKENS;
+  return value;
+}
+
+export const CHUNK_SIZE_TOKENS = resolveChunkSizeTokens();
 export const CHUNK_OVERLAP_TOKENS = Math.floor(CHUNK_SIZE_TOKENS * 0.15);  // 135 tokens (15% overlap)
 // Fallback char-based approximation for sync chunking (~4 chars per token)
 export const CHUNK_SIZE_CHARS = CHUNK_SIZE_TOKENS * 4;  // 3600 chars
 export const CHUNK_OVERLAP_CHARS = CHUNK_OVERLAP_TOKENS * 4;  // 540 chars
-// Search window for finding optimal break points (in tokens, ~200 tokens)
-export const CHUNK_WINDOW_TOKENS = 200;
+// Search window for finding optimal break points (in tokens, ~200 tokens at the default size)
+export const CHUNK_WINDOW_TOKENS = Math.round(CHUNK_SIZE_TOKENS * 2 / 9);
 export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
 
 export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): string {
@@ -6211,6 +6225,7 @@ export interface HybridQueryOptions {
   explain?: boolean;        // include backend/RRF/rerank score traces
   intent?: string;          // domain intent hint for disambiguation
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
+  skipExpansion?: boolean;  // skip LLM query expansion (no local generate model is loaded)
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
@@ -6315,7 +6330,7 @@ export async function hybridQuery(
   // Step 2: Expand query (or skip if strong signal)
   hooks?.onExpandStart?.();
   const expandStart = Date.now();
-  const expanded = hasStrongSignal
+  const expanded = hasStrongSignal || options?.skipExpansion
     ? []
     : await store.expandQuery(query);
 
@@ -6581,6 +6596,7 @@ export interface VectorSearchOptions {
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
+  skipExpansion?: boolean;  // skip LLM query expansion: embed the query as typed
   hooks?: Pick<SearchHooks, 'onExpand'>;
 }
 
@@ -6620,7 +6636,7 @@ export async function vectorSearchQuery(
 
   // Expand query — filter to vec/hyde only (lex queries target FTS, not vector)
   const expandStart = Date.now();
-  const allExpanded = await store.expandQuery(query);
+  const allExpanded = options?.skipExpansion ? [] : await store.expandQuery(query);
   const vecExpanded = allExpanded.filter(q => q.type !== 'lex');
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 

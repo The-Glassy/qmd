@@ -761,7 +761,8 @@ function collectSensitiveSnapshot(): SensitiveSnapshot {
       path: col.path,
     })),
     models: {
-      embed: config.models?.embed,
+      // A remote endpoint list is gated as one string: any change re-asks for trust.
+      embed: Array.isArray(config.models?.embed) ? config.models.embed.join(", ") : config.models?.embed,
       rerank: config.models?.rerank,
       generate: config.models?.generate,
     },
@@ -2563,6 +2564,7 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  skipExpansion?: boolean;  // Skip LLM query expansion (query/vsearch)
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
   fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
   filter?: MetadataFilter;  // Metadata filter (--filter JSON)
@@ -3168,6 +3170,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
+      skipExpansion: opts.skipExpansion,
       hooks: {
         onExpand: (original, expanded) => {
           logExpansionTree(original, expanded);
@@ -3267,6 +3270,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
         skipRerank: opts.skipRerank,
+        skipExpansion: opts.skipExpansion,
         explain: !!opts.explain,
         intent,
         chunkStrategy: opts.chunkStrategy,
@@ -3396,6 +3400,7 @@ function parseCLI() {
       // Query options
       "candidate-limit": { type: "string", short: "C" },
       "no-rerank": { type: "boolean", default: false },
+      "no-expand": { type: "boolean", default: false },
       "no-gpu": { type: "boolean", default: false },
       intent: { type: "string" },
       // Chunking options
@@ -3467,6 +3472,7 @@ function parseCLI() {
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
+    skipExpansion: !!values["no-expand"],
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
@@ -3980,6 +3986,7 @@ function showHelp(): void {
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
+  console.log("  --no-expand                - Skip LLM query expansion (query/vsearch; no local generate model)");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
   console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
@@ -4289,7 +4296,7 @@ export async function checkEmbeddingVectorSamples(db: Database, model: string, f
   const threshold = 0.0001;
   const mismatches: string[] = [];
 
-  await withLLMSessionForLlm(llm, async (session) => {
+  await withLLMSession(async (session) => {
     for (const sample of samples) {
       const hashSeq = `${sample.hash}_${sample.seq}`;
       const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
@@ -4575,7 +4582,7 @@ async function showDoctor(): Promise<void> {
   }
 
   try {
-    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint, storeInstance.llm ?? getDefaultLlamaCpp());
+    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
     doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
     if (!vectorSample.ok) {
       nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");

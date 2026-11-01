@@ -32,6 +32,8 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   getEmbeddingFingerprint,
+  resolveChunkSizeTokens,
+  DEFAULT_CHUNK_SIZE_TOKENS,
   chunkDocument,
   chunkDocumentByTokens,
   chunkDocumentAsync,
@@ -6216,6 +6218,32 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("skipExpansion never calls expandQuery in hybridQuery or vectorSearchQuery", async () => {
+    const store = await createTestStore();
+    const model = "bge-m3";
+    const expandSpy = vi.fn(async () => { throw new Error("expansion must not run"); });
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]) as any;
+
+    store.db.exec(`CREATE TABLE ${VEC_TABLE} (collection_id INTEGER, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => ({ embedding: [1, 0], model }))),
+    } as any;
+    store.searchVec = searchVecSpy as any;
+    store.searchFTS = vi.fn(() => []) as any;
+    store.expandQuery = expandSpy as any;
+
+    try {
+      await hybridQuery(store, "q", { limit: 5, minScore: 0, skipRerank: true, skipExpansion: true });
+      await vectorSearchQuery(store, "q", { limit: 5, minScore: 0, skipExpansion: true });
+
+      expect(expandSpy).not.toHaveBeenCalled();
+      expect(searchVecSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("hybridQuery routes lex expansions to FTS and vec/hyde to vector search (#680)", async () => {
     const store = await createTestStore();
     const model = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
@@ -6690,6 +6718,15 @@ describe("Embedding batching", () => {
 });
 
 describe("Token chunking guardrails", () => {
+  test("QMD_CHUNK_SIZE_TOKENS accepts an integer in 64..8192 and falls back to the default otherwise", () => {
+    expect(resolveChunkSizeTokens(undefined)).toBe(DEFAULT_CHUNK_SIZE_TOKENS);
+    expect(resolveChunkSizeTokens("")).toBe(DEFAULT_CHUNK_SIZE_TOKENS);
+    expect(resolveChunkSizeTokens(" 350 ")).toBe(350);
+    for (const bad of ["abc", "12.5", "63", "8193", "-1"]) {
+      expect(resolveChunkSizeTokens(bad)).toBe(DEFAULT_CHUNK_SIZE_TOKENS);
+    }
+  });
+
   test("chunkDocumentByTokens keeps pathological single-line blobs under the token limit", async () => {
     setDefaultLlamaCpp({
       isRemoteEmbed() { return false; },
