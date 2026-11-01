@@ -2360,8 +2360,11 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
 
     // Only fill in `embed` when it was never configured — an explicit string or
     // array config (including remote endpoint lists) must never be clobbered
-    // with the collapsed identity.
-    const needsEmbedWrite = current.embed === undefined;
+    // with the collapsed identity. A remote endpoint from QMD_EMBED_MODEL is not
+    // persisted either: its identity (the #model-id) is not a loadable model, so
+    // writing it would make the next run look for a local GGUF of that name.
+    const needsEmbedWrite = current.embed === undefined
+      && !resolveEmbedEndpoints(undefined, process.env.QMD_EMBED_MODEL).some(isRemoteEmbedModel);
     const needsOtherWrite = current.generate !== generate || current.rerank !== rerank;
     if (needsEmbedWrite || needsOtherWrite) {
       saveConfig({

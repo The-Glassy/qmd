@@ -18,7 +18,7 @@ import { openDatabase } from "../src/db.ts";
 import { createStore, insertContent, insertDocument } from "../src/store.ts";
 import { VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE, VEC_TABLE } from "../src/vec-layout.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
-import { setConfigSource } from "../src/collections.ts";
+import { loadConfig, setConfigSource } from "../src/collections.ts";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -323,6 +323,23 @@ describe("CLI Embed", () => {
 
     try {
       expect(resolveEmbedModelForCli()).toBe("hf:env/embed-model.gguf");
+    } finally {
+      setConfigSource();
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
+  test("does not persist a remote QMD_EMBED_MODEL identity into the config", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "http://127.0.0.1:8090/v1#bge-m3";
+    setConfigSource({ config: { collections: {} } });
+
+    try {
+      expect(resolveEmbedModelForCli()).toBe("bge-m3");
+      // Writing "bge-m3" would make the next run look for a local GGUF of that name.
+      expect(loadConfig().models?.embed).toBeUndefined();
+      expect(resolveEmbedModelForCli()).toBe("bge-m3");
     } finally {
       setConfigSource();
       if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
