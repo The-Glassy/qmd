@@ -654,6 +654,19 @@ Auth and tuning are set via environment variables (never in the URI):
 | `QMD_EMBED_API_KEY` (falls back to `OPENAI_API_KEY`) | `Authorization: Bearer <key>` sent to every endpoint; omitted entirely if unset (e.g. unauthenticated LM Studio) | unset |
 | `QMD_EMBED_TIMEOUT_MS` | Per-request timeout for `/embeddings` | `30000` |
 | `QMD_EMBED_HEALTH_TTL_MS` | How long a failed endpoint is skipped before retry | `15000` |
+| `QMD_EMBED_BATCH_SIZE` | Max texts per `/embeddings` request (larger batches are split) | no limit |
+| `QMD_EMBED_DELAY_MS` | Pause between consecutive requests, to keep the load on a shared server low | `0` |
+| `QMD_EMBED_MAX_CHARS` | Per-text character cap applied before sending | `12000` |
+| `QMD_CHUNK_SIZE_TOKENS` | Chunk size (64..8192); overlap and break-point window scale with it. Changing it re-embeds | `900` |
+
+The remote path has no tokenizer for the server's model, so chunks are sized by a
+character estimate (3 chars per token). For a server with a small context, lower
+`QMD_CHUNK_SIZE_TOKENS`: llama.cpp's `llama-server -c 512` rejects longer inputs.
+A text the server rejects as too large gets no vector (the rest of its batch is
+kept, and `qmd embed` reports it); BM25 search still finds it.
+
+To query without loading any local model, skip expansion and reranking:
+`qmd vsearch --no-expand`, `qmd query --no-expand --no-rerank`.
 
 `qmd doctor` reports configured remote endpoints, the shared model id, and
 whether an API key is set (never its value). `qmd pull` only downloads local
